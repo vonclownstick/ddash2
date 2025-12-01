@@ -24,6 +24,17 @@ from Bio import Entrez
 import openai
 from rank_bm25 import BM25Okapi
 
+# Optional imports for UMAP visualization (installed separately)
+try:
+    import numpy as np
+    import umap
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler
+    UMAP_AVAILABLE = True
+except ImportError:
+    UMAP_AVAILABLE = False
+    np = None  # type: ignore
+
 # --- LOGGING SETUP ---
 logging.basicConfig(
     level=logging.INFO,
@@ -1198,6 +1209,242 @@ def perform_ai_profiling():
              set_system_status(status_db, f"Error: {str(e)[:50]}")
 
 
+# --- JOB 4: EMBEDDING GENERATION ---
+
+def perform_embedding_generation():
+    """
+    Generate dual embeddings for all investigators.
+    AIDEV-NOTE: Runs automatically after AI profiling or when needed for UMAP.
+    """
+    logger.info("STARTING EMBEDDING GENERATION JOB...")
+    if not DB_AVAILABLE:
+        logger.error("Database not available, skipping embedding generation")
+        return
+
+    db = SessionLocal()
+    try:
+        set_system_status(db, "Generating Embeddings...")
+
+        # Get investigators that need embeddings
+        investigators = db.query(InvestigatorStat).filter(
+            (InvestigatorStat.embedding_themes_pops == None) |
+            (InvestigatorStat.embedding_themes_pops == 'null') |
+            (InvestigatorStat.embedding_titles == None) |
+            (InvestigatorStat.embedding_titles == 'null')
+        ).all()
+
+        logger.info(f"Found {len(investigators)} investigators needing embeddings")
+
+        success_count = 0
+        two_years_ago = datetime.now() - timedelta(days=730)
+
+        for i, inv in enumerate(investigators, 1):
+            try:
+                # Build themes/pops text
+                themes = json.loads(inv.tech_json) if inv.tech_json else []
+                pops = json.loads(inv.population_json) if inv.population_json else []
+
+                themes_pops_parts = []
+                if themes:
+                    themes_pops_parts.append(f"Research technologies and methods: {', '.join(themes)}")
+                if pops:
+                    themes_pops_parts.append(f"Study populations and cohorts: {', '.join(pops)}")
+                themes_pops_text = "\n\n".join(themes_pops_parts) if themes_pops_parts else "No themes or populations available"
+
+                # Build titles text
+                pmids = json.loads(inv.pmids_p2_json) if inv.pmids_p2_json else []
+                papers = db.query(PaperDetail).filter(
+                    PaperDetail.pmid.in_(pmids),
+                    PaperDetail.pub_date >= two_years_ago
+                ).all() if pmids else []
+
+                # Sort by RCR and get top 20
+                papers_sorted = sorted(papers, key=lambda x: x.rcr or 0, reverse=True)[:20]
+                pub_titles = [p.title for p in papers_sorted if p.title]
+
+                grants = db.query(GrantDetail).filter(
+                    GrantDetail.investigator_id == inv.id,
+                    GrantDetail.fiscal_year >= datetime.now().year - 2
+                ).all()
+                grant_titles = [g.project_title for g in grants if g.project_title]
+
+                titles_parts = []
+                if pub_titles:
+                    titles_parts.append(f"Publication titles: {' | '.join(pub_titles)}")
+                if grant_titles:
+                    titles_parts.append(f"Grant titles: {' | '.join(grant_titles)}")
+                titles_text = "\n\n".join(titles_parts) if titles_parts else "No publication or grant titles available"
+
+                # Generate embeddings
+                if themes_pops_text.strip():
+                    response1 = client.embeddings.create(
+                        input=themes_pops_text,
+                        model="text-embedding-3-large"
+                    )
+                    embedding_themes_pops = response1.data[0].embedding
+                else:
+                    embedding_themes_pops = [0.0] * 3072
+
+                if titles_text.strip():
+                    response2 = client.embeddings.create(
+                        input=titles_text,
+                        model="text-embedding-3-large"
+                    )
+                    embedding_titles = response2.data[0].embedding
+                else:
+                    embedding_titles = [0.0] * 3072
+
+                # Save to database
+                inv.embedding_themes_pops = json.dumps(embedding_themes_pops)
+                inv.embedding_titles = json.dumps(embedding_titles)
+                db.commit()
+
+                success_count += 1
+
+                if i % 10 == 0:
+                    set_system_status(db, f"Embeddings: {i}/{len(investigators)}")
+                    logger.info(f"Generated embeddings for {i}/{len(investigators)} investigators")
+                    time.sleep(0.5)  # Rate limiting
+
+            except Exception as e:
+                logger.error(f"Error generating embedding for {inv.id}: {e}")
+                db.rollback()
+                continue
+
+        set_system_status(db, "Ready", update_time=True)
+        logger.info(f"Embedding generation complete! Success: {success_count}/{len(investigators)}")
+
+        # Automatically trigger UMAP generation after embeddings
+        if success_count > 0:
+            logger.info("Triggering UMAP generation...")
+            threading.Thread(target=perform_umap_generation).start()
+
+    except Exception as e:
+        logger.error(f"EMBEDDING JOB FAILURE: {e}")
+        set_system_status(db, f"Error: {str(e)[:50]}")
+    finally:
+        db.close()
+
+
+# --- JOB 5: UMAP GENERATION ---
+
+def perform_umap_generation():
+    """
+    Generate 3D UMAP coordinates and clusters from embeddings.
+    AIDEV-NOTE: Automatically triggered after embedding generation.
+    """
+    logger.info("STARTING UMAP GENERATION JOB...")
+
+    if not DB_AVAILABLE:
+        logger.error("Database not available, skipping UMAP generation")
+        return
+
+    if not UMAP_AVAILABLE:
+        logger.error("UMAP libraries not available! Install with: pip install umap-learn scikit-learn numpy")
+        return
+
+    db = SessionLocal()
+    try:
+        set_system_status(db, "Generating UMAP Visualization...")
+
+        # Load investigators with dual embeddings
+        investigators = db.query(InvestigatorStat).filter(
+            InvestigatorStat.embedding_themes_pops != None,
+            InvestigatorStat.embedding_themes_pops != 'null',
+            InvestigatorStat.embedding_titles != None,
+            InvestigatorStat.embedding_titles != 'null'
+        ).all()
+
+        if not investigators:
+            logger.error("No investigators with embeddings found! Run embedding generation first.")
+            set_system_status(db, "Error: No embeddings")
+            return
+
+        logger.info(f"Loaded {len(investigators)} investigators with embeddings")
+
+        # Parse embeddings and combine (75% themes/pops + 25% titles)
+        investigator_ids = []
+        embeddings_list = []
+
+        for inv in investigators:
+            try:
+                themes_pops_emb = np.array(json.loads(inv.embedding_themes_pops))
+                titles_emb = np.array(json.loads(inv.embedding_titles))
+                combined = 0.75 * themes_pops_emb + 0.25 * titles_emb
+
+                investigator_ids.append(inv.id)
+                embeddings_list.append(combined)
+            except Exception as e:
+                logger.warning(f"Skipping {inv.id}: {e}")
+                continue
+
+        if not embeddings_list:
+            logger.error("Failed to load any valid embeddings")
+            set_system_status(db, "Error: Invalid embeddings")
+            return
+
+        embeddings_matrix = np.array(embeddings_list)
+        logger.info(f"Embeddings matrix shape: {embeddings_matrix.shape}")
+
+        # Compute 3D UMAP
+        set_system_status(db, "Computing 3D UMAP...")
+        logger.info("Computing 3D UMAP...")
+
+        reducer = umap.UMAP(
+            n_components=3,
+            n_neighbors=15,
+            min_dist=0.1,
+            metric='cosine',
+            random_state=42
+        )
+        umap_coords = reducer.fit_transform(embeddings_matrix)
+        logger.info(f"UMAP computed, shape: {umap_coords.shape}")
+
+        # Cluster investigators
+        set_system_status(db, "Clustering investigators...")
+        logger.info("Clustering investigators...")
+
+        scaler = StandardScaler()
+        embeddings_scaled = scaler.fit_transform(embeddings_matrix)
+
+        kmeans = KMeans(n_clusters=8, random_state=42, n_init=10)
+        cluster_ids = kmeans.fit_predict(embeddings_scaled)
+
+        # Show cluster distribution
+        unique, counts = np.unique(cluster_ids, return_counts=True)
+        for cluster_id, count in zip(unique, counts):
+            logger.info(f"   Cluster {cluster_id}: {count} investigators")
+
+        # Save to database
+        set_system_status(db, "Saving UMAP data...")
+        logger.info("Saving UMAP data to database...")
+
+        for i, inv_id in enumerate(investigator_ids):
+            x, y, z = float(umap_coords[i, 0]), float(umap_coords[i, 1]), float(umap_coords[i, 2])
+            cluster_id = int(cluster_ids[i])
+
+            inv = db.query(InvestigatorStat).filter_by(id=inv_id).first()
+            if inv:
+                inv.umap_x = x
+                inv.umap_y = y
+                inv.umap_z = z
+                inv.cluster_id = cluster_id
+
+            if (i + 1) % 100 == 0:
+                db.commit()
+                logger.info(f"   Saved {i + 1}/{len(investigator_ids)} investigators")
+
+        db.commit()
+        set_system_status(db, "Ready", update_time=True)
+        logger.info(f"UMAP generation complete! Saved {len(investigator_ids)} investigators")
+
+    except Exception as e:
+        logger.error(f"UMAP JOB FAILURE: {e}")
+        set_system_status(db, f"Error: {str(e)[:50]}")
+    finally:
+        db.close()
+
+
 # --- ROUTES ---
 
 @app.get("/login", response_class=HTMLResponse)
@@ -1632,6 +1879,34 @@ def get_umap_data(request: Request, db: Session = Depends(get_db)):
         return {"error": "Database unavailable"}
 
     try:
+        # AIDEV-NOTE: Check if UMAP data exists, automatically generate if missing
+        # First check if any investigators have UMAP coordinates
+        umap_count = db.query(InvestigatorStat).filter(
+            InvestigatorStat.umap_x != 0.0,
+            InvestigatorStat.umap_y != 0.0,
+            InvestigatorStat.umap_z != 0.0
+        ).count()
+
+        if umap_count == 0:
+            # Check if we have embeddings to generate UMAP from
+            embedding_count = db.query(InvestigatorStat).filter(
+                InvestigatorStat.embedding_themes_pops != None,
+                InvestigatorStat.embedding_themes_pops != 'null',
+                InvestigatorStat.embedding_titles != None,
+                InvestigatorStat.embedding_titles != 'null'
+            ).count()
+
+            if embedding_count == 0:
+                # No embeddings either - trigger embedding generation
+                logger.info("No embeddings found, triggering embedding generation...")
+                threading.Thread(target=perform_embedding_generation).start()
+                return {"status": "generating", "message": "Generating AI embeddings and UMAP visualization. This takes 5-10 minutes. Please refresh in a few minutes."}
+            else:
+                # Have embeddings but no UMAP - trigger UMAP generation
+                logger.info("Embeddings found but no UMAP, triggering UMAP generation...")
+                threading.Thread(target=perform_umap_generation).start()
+                return {"status": "generating", "message": "Generating UMAP visualization from existing embeddings. This takes 2-3 minutes. Please refresh shortly."}
+
         # Load all investigators with UMAP coordinates
         all_investigators = db.query(InvestigatorStat).filter(
             InvestigatorStat.umap_x != 0.0,
@@ -1651,7 +1926,7 @@ def get_umap_data(request: Request, db: Session = Depends(get_db)):
         ]
 
         if not investigators:
-            return {"error": "No UMAP data found. Run 'python generate_umap.py' first."}
+            return {"error": "No valid investigators for visualization after filtering."}
 
         # Build node data
         nodes = []
