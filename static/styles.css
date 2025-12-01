@@ -1,0 +1,53 @@
+.sortable-header {
+    cursor: pointer;
+    user-select: none;
+}
+
+.sortable-header:hover {
+    background-color: #e5e7eb;
+}
+
+.sort-icon::after {
+    content: ' ↕';
+    opacity: 0.3;
+}
+
+.asc::after {
+    content: ' ↑';
+    opacity: 1;
+}
+
+.desc::after {
+    content: ' ↓';
+    opacity: 1;
+}
+
+.modal-body {
+    max-height: calc(100vh - 250px);
+}
+
+td, th {
+    white-space: nowrap;
+}
+
+.tab-btn.active {
+    border-bottom: 2px solid #2563eb;
+    color: #1e3a8a;
+    font-weight: 600;
+}
+
+.tab-btn {
+    color: #6b7280;
+    font-weight: 500;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
