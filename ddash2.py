@@ -740,23 +740,57 @@ def perform_publication_scrape(department: str = "psychiatry"):
                 logger.error(f"Phase 2 Error for {aid}: {e}")
                 continue
 
-        # Fetch iCite scores for all papers
-        set_system_status(db, "Fetching iCite Scores...")
-        all_pmids_list = list(temp_papers.keys())
-        rcr_scores = fetch_icite_scores(all_pmids_list)
-        for pid, score in rcr_scores.items():
-            if pid in temp_papers:
-                temp_papers[pid]["rcr"] = score
+            # AIDEV-NOTE: Batch save every 100 faculty to prevent OOM on 512MB instances
+            # Save papers to DB, fetch iCite scores, then clear memory
+            if faculty_count % 100 == 0 or faculty_count == total_faculty:
+                logger.info(f"Batch save at {faculty_count}/{total_faculty} faculty ({len(temp_papers)} papers)...")
 
-        # Save all papers to database
-        for pid, p_data in temp_papers.items():
-            db.merge(PaperDetail(
-                pmid=pid,
-                title=p_data['title'],
-                journal=p_data['journal'],
-                pub_date=p_data['pub_date'],
-                rcr=p_data['rcr']
-            ))
+                # Fetch iCite scores for this batch
+                batch_pmids = list(temp_papers.keys())
+                if batch_pmids:
+                    rcr_scores = fetch_icite_scores(batch_pmids)
+                    for pid, score in rcr_scores.items():
+                        if pid in temp_papers:
+                            temp_papers[pid]["rcr"] = score
+
+                # Save papers to database
+                for pid, p_data in temp_papers.items():
+                    db.merge(PaperDetail(
+                        pmid=pid,
+                        title=p_data['title'],
+                        journal=p_data['journal'],
+                        pub_date=p_data['pub_date'],
+                        rcr=p_data['rcr']
+                    ))
+
+                db.commit()
+                db.expunge_all()  # Clear session
+                temp_papers.clear()  # Clear paper cache
+
+                import gc
+                gc.collect()  # Force garbage collection
+                logger.info(f"Batch saved and memory freed")
+
+        # AIDEV-NOTE: Papers are now saved in batches above
+        # This section handles any remaining papers if total_faculty is not divisible by 100
+        if temp_papers:
+            logger.info(f"Saving final batch of {len(temp_papers)} papers...")
+            batch_pmids = list(temp_papers.keys())
+            rcr_scores = fetch_icite_scores(batch_pmids)
+            for pid, score in rcr_scores.items():
+                if pid in temp_papers:
+                    temp_papers[pid]["rcr"] = score
+
+            for pid, p_data in temp_papers.items():
+                db.merge(PaperDetail(
+                    pmid=pid,
+                    title=p_data['title'],
+                    journal=p_data['journal'],
+                    pub_date=p_data['pub_date'],
+                    rcr=p_data['rcr']
+                ))
+            db.commit()
+            temp_papers.clear()
 
         # ====================
         # PHASE 3: CREATE INVESTIGATOR RECORDS WITH MISCLASSIFICATION DETECTION
@@ -790,8 +824,16 @@ def perform_publication_scrape(department: str = "psychiatry"):
             set_p1 = list(data["pmids_p1"])
             set_p2 = list(data["pmids_p2"])
 
-            rcr_p2 = sum(temp_papers[pid]["rcr"] for pid in set_p2 if pid in temp_papers)
-            rcr_p1 = sum(temp_papers[pid]["rcr"] for pid in set_p1 if pid in temp_papers)
+            # AIDEV-NOTE: Query database for RCR since temp_papers is cleared in batches
+            rcr_p1 = 0.0
+            rcr_p2 = 0.0
+            if set_p1:
+                papers_p1 = db.query(PaperDetail).filter(PaperDetail.pmid.in_(set_p1)).all()
+                rcr_p1 = sum(p.rcr for p in papers_p1)
+            if set_p2:
+                papers_p2 = db.query(PaperDetail).filter(PaperDetail.pmid.in_(set_p2)).all()
+                rcr_p2 = sum(p.rcr for p in papers_p2)
+
             n_p1, n_p2 = len(set_p1), len(set_p2)
 
             def get_delta(prev, curr):
