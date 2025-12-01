@@ -885,18 +885,28 @@ def perform_grant_scrape():
 
                 if not p_first or not p_last: continue
 
+                # AIDEV-NOTE: Extract initials from full name (e.g., "ROY HERBERT" → "RH")
                 p_first_clean = p_first.split(" ")[0]
-                match_key = f"{p_last}_{p_first_clean}"
+                name_parts = p_first.split()
+                p_initials = ''.join([part[0] for part in name_parts if part])
 
                 matched_ids = []
 
-                if match_key in canonical_map:
-                    matched_ids = canonical_map[match_key]
-                else:
-                    if len(p_first_clean) > 0:
-                        initial_key = f"{p_last}_{p_first_clean[0]}"
-                        if initial_key in canonical_map:
-                            matched_ids = canonical_map[initial_key]
+                # AIDEV-NOTE: Fuzzy matching with prefix logic (same as publications)
+                # Try matching: exact initials, full name, or prefix match
+                # Examples: "PERLIS_RH" matches "Roy H", "Roy", "R", etc.
+                for canonical_key in canonical_map.keys():
+                    canonical_last, canonical_initials = canonical_key.split('_')
+
+                    if canonical_last != p_last:
+                        continue
+
+                    # Prefix matching: either direction
+                    # "RH" matches "R", "R" matches "RH"
+                    if (canonical_initials.startswith(p_initials) or
+                        p_initials.startswith(canonical_initials)):
+                        matched_ids.extend(canonical_map[canonical_key])
+                        break
 
                 if matched_ids:
                     for inv_id in matched_ids:
