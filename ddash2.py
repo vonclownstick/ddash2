@@ -40,6 +40,11 @@ SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ENTREZ_EMAIL = os.getenv("ENTREZ_EMAIL", "user@example.com")
 
+# AIDEV-NOTE: Debug logging to verify environment variables are loaded
+logger.info(f"Environment check: USER_PASSWORD={'set' if USER_PASSWORD else 'MISSING'}, "
+            f"ADMIN_PASSWORD={'set' if ADMIN_PASSWORD else 'MISSING'}, "
+            f"PI123_PASSWORD={'set' if PI123_PASSWORD else 'MISSING'}")
+
 if not USER_PASSWORD or not ADMIN_PASSWORD or not PI123_PASSWORD:
     logger.warning("⚠️  USER_PASSWORD, ADMIN_PASSWORD, and PI123_PASSWORD not set! Using defaults (INSECURE)")
     USER_PASSWORD = "user123"
