@@ -40,16 +40,22 @@ SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ENTREZ_EMAIL = os.getenv("ENTREZ_EMAIL", "user@example.com")
 
-# AIDEV-NOTE: Debug logging to verify environment variables are loaded
-logger.info(f"Environment check: USER_PASSWORD={'set' if USER_PASSWORD else 'MISSING'}, "
-            f"ADMIN_PASSWORD={'set' if ADMIN_PASSWORD else 'MISSING'}, "
-            f"PI123_PASSWORD={'set' if PI123_PASSWORD else 'MISSING'}")
-
-if not USER_PASSWORD or not ADMIN_PASSWORD or not PI123_PASSWORD:
-    logger.warning("⚠️  USER_PASSWORD, ADMIN_PASSWORD, and PI123_PASSWORD not set! Using defaults (INSECURE)")
+# AIDEV-NOTE: Set defaults only for missing passwords (don't overwrite ones that are set!)
+missing_passwords = []
+if not USER_PASSWORD:
     USER_PASSWORD = "user123"
+    missing_passwords.append("USER_PASSWORD")
+if not ADMIN_PASSWORD:
     ADMIN_PASSWORD = "admin123"
+    missing_passwords.append("ADMIN_PASSWORD")
+if not PI123_PASSWORD:
     PI123_PASSWORD = "pi123"
+    missing_passwords.append("PI123_PASSWORD")
+
+if missing_passwords:
+    logger.warning(f"⚠️  {', '.join(missing_passwords)} not set! Using defaults (INSECURE)")
+else:
+    logger.info("✅ All password environment variables are set")
 
 if not OPENAI_API_KEY:
     logger.warning("⚠️  OPENAI_API_KEY not set! AI profiling will fail.")
