@@ -235,15 +235,6 @@ if DB_AVAILABLE:
         logger.error(f"Database initialization failed: {e}")
         DB_AVAILABLE = False
 
-    def get_db():
-        if not DB_AVAILABLE:
-            raise HTTPException(status_code=503, detail="Database unavailable")
-        db = SessionLocal()
-        try:
-            yield db
-        finally:
-            db.close()
-
     # --- SELF-HEALING STARTUP ---
     if DB_AVAILABLE:
         try:
@@ -254,6 +245,17 @@ if DB_AVAILABLE:
                     db.commit()
         except Exception as e:
             logger.warning(f"Startup DB Check failed: {e}")
+
+# AIDEV-NOTE: get_db must be defined at module level, not inside if DB_AVAILABLE block
+# This ensures routes can import it even if initial DB connection fails
+def get_db():
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # --- EXTERNAL API CONFIGURATION ---
 Entrez.email = ENTREZ_EMAIL
