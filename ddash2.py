@@ -10,6 +10,7 @@ import math
 import sqlite3
 import concurrent.futures
 import secrets
+import unicodedata
 from typing import List, Dict, Set, Optional, Any
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -339,6 +340,26 @@ def set_system_status(db: Session, status: str, update_time: bool = False):
         logger.error(f"DB Error setting status: {e}")
         db.rollback()
 
+def normalize_text(text: str) -> str:
+    """
+    Normalize text by removing accents and converting to uppercase.
+
+    AIDEV-NOTE: Handles names with accented characters (e.g., "Öngür" → "ONGUR")
+    This ensures name matching works regardless of Unicode encoding or accent usage.
+
+    Examples:
+        "Öngür" → "ONGUR"
+        "José" → "JOSE"
+        "François" → "FRANCOIS"
+    """
+    if not text:
+        return ""
+    # Decompose Unicode characters (e.g., "ö" → "o" + combining diaeresis)
+    nfd = unicodedata.normalize('NFD', text)
+    # Filter out combining diacritical marks
+    without_accents = ''.join(char for char in nfd if unicodedata.category(char) != 'Mn')
+    return without_accents.upper()
+
 def get_date_windows():
     now = datetime.now()
     p2_end = now
@@ -404,7 +425,24 @@ def fetch_icite_scores(pmids: List[str]) -> Dict[str, float]:
     return scores
 
 def parse_pubmed_date(article_data: Dict, medline_citation: Dict) -> datetime:
+    """
+    Parse publication date from PubMed data.
+
+    AIDEV-NOTE: Prioritize ArticleDate (e-pub) over journal publication date
+    to avoid ahead-of-print papers being counted in future years.
+    """
     try:
+        # FIRST: Try ArticleDate (electronic publication date)
+        article_dates = article_data.get('ArticleDate', [])
+        if article_dates:
+            art_date = article_dates[0]  # Use first ArticleDate
+            year = art_date.get('Year')
+            month = art_date.get('Month', '1')
+            day = art_date.get('Day', '1')
+            if year:
+                return datetime(int(year), int(month), int(day))
+
+        # SECOND: Fall back to Journal PubDate
         pub_date = article_data.get('Journal', {}).get('JournalIssue', {}).get('PubDate', {})
         year = pub_date.get('Year') or medline_citation.get('DateCompleted', {}).get('Year')
         if not year: return datetime.now()
@@ -495,7 +533,8 @@ def perform_publication_scrape(department: str = "psychiatry"):
                                     # AIDEV-NOTE: Smart deduplication using prefix matching
                                     # Examples: "Perlis R" and "Perlis RH" merge to PERLIS_RH (same person)
                                     #           "Rauch SL" and "Rauch SD" stay separate (different people)
-                                    last_clean = last.upper()
+                                    # Normalize to handle accented characters (e.g., "Öngür" → "ONGUR")
+                                    last_clean = normalize_text(last)
 
                                     # Prefer using the Initials field (e.g., "SL", "BC", "RH")
                                     if initials and len(initials) > 0:
@@ -621,7 +660,8 @@ def perform_publication_scrape(department: str = "psychiatry"):
                     if 'AuthorList' in art:
                         for auth in art['AuthorList']:
                             if 'LastName' in auth:
-                                auth_last = auth['LastName'].upper()
+                                # Normalize to handle accented characters (e.g., "Öngür" → "ONGUR")
+                                auth_last = normalize_text(auth['LastName'])
                                 auth_first = auth.get('ForeName', '')
                                 auth_initials_raw = auth.get('Initials', '')
 
@@ -642,7 +682,7 @@ def perform_publication_scrape(department: str = "psychiatry"):
                                 #           paper "Rauch SL" matches canonical "RAUCH_SL"
                                 #           paper "Rauch S" matches canonical "RAUCH_SL" but NOT "RAUCH_SD"
                                 initials_match = False
-                                if auth_last == last_name and auth_all_initials:
+                                if auth_last == normalize_text(last_name) and auth_all_initials:
                                     # Exact match or prefix match
                                     if auth_all_initials == all_initials:
                                         initials_match = True
@@ -829,7 +869,8 @@ def perform_grant_scrape():
             parts = inv.id.split('_')
             if len(parts) == 2:
                 last, first_part = parts
-                key = f"{last.upper()}_{first_part.upper()}"
+                # AIDEV-NOTE: Use normalize_text() for accented characters (e.g., "Öngür")
+                key = f"{normalize_text(last)}_{normalize_text(first_part)}"
                 if key not in canonical_map: canonical_map[key] = []
                 canonical_map[key].append(inv.id)
 
@@ -837,7 +878,8 @@ def perform_grant_scrape():
                 # Query with "R" will match "Roy", "Roy H", "Robert", etc.
                 # Then fuzzy matching filters to correct investigator
                 first_initial = first_part[0] if first_part else ""
-                query_names.append({"last_name": last, "first_name": first_initial})
+                # Normalize last name for query to handle accents
+                query_names.append({"last_name": normalize_text(last), "first_name": first_initial})
 
         batch_size = 20
         current_year = datetime.now().year
@@ -885,8 +927,9 @@ def perform_grant_scrape():
             pis = g.get('principal_investigators') or []
 
             for pi in pis:
-                p_first = (pi.get('first_name') or '').upper()
-                p_last = (pi.get('last_name') or '').upper()
+                # AIDEV-NOTE: Normalize names to handle accented characters
+                p_first = normalize_text(pi.get('first_name') or '')
+                p_last = normalize_text(pi.get('last_name') or '')
 
                 if not p_first or not p_last: continue
 
