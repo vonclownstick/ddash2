@@ -832,7 +832,12 @@ def perform_grant_scrape():
                 key = f"{last.upper()}_{first_part.upper()}"
                 if key not in canonical_map: canonical_map[key] = []
                 canonical_map[key].append(inv.id)
-                query_names.append({"last_name": last, "first_name": first_part})
+
+                # AIDEV-NOTE: NIH Reporter query uses only first initial
+                # Query with "R" will match "Roy", "Roy H", "Robert", etc.
+                # Then fuzzy matching filters to correct investigator
+                first_initial = first_part[0] if first_part else ""
+                query_names.append({"last_name": last, "first_name": first_initial})
 
         batch_size = 20
         current_year = datetime.now().year
