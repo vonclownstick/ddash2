@@ -385,12 +385,32 @@ def determine_hospital(affiliation_text: str, department: str = "psychiatry") ->
 
     AIDEV-NOTE: Multi-department support - department filter is applied here.
     Currently only 'psychiatry' is implemented, but can be extended.
+
+    AIDEV-NOTE: Exclusion logic to prevent false positives:
+    - Excludes Beth Israel Deaconess Medical Center (not part of MGB Psychiatry)
+    - Excludes Boston Children's Hospital (separate from adult psychiatry)
+    - Excludes "Psychiatry and Neurology" joint departments (these are Neurology)
+    - Requires specific hospital names, not just "Massachusetts"
     """
     text = affiliation_text.lower()
     dept_keywords = {
         "psychiatry": ['psychiatry', 'psychiatric'],
         # Add more departments here as needed
     }
+
+    # EXCLUSIONS: Institutions that should NOT match
+    exclusions = [
+        'beth israel',
+        'children\'s hospital',
+        'childrens hospital',
+        'boston children',
+        'university of massachusetts',
+        'umass'
+    ]
+
+    for exclusion in exclusions:
+        if exclusion in text:
+            return None  # Explicitly excluded institution
 
     # Check if affiliation matches the department
     if department not in dept_keywords:
@@ -399,11 +419,23 @@ def determine_hospital(affiliation_text: str, department: str = "psychiatry") ->
     if not any(keyword in text for keyword in dept_keywords[department]):
         return None  # Doesn't match department
 
-    # Check which hospital
-    if 'women' in text: return 'BWH'
-    if 'massachusetts' in text: return 'MGH'
-    if 'mclean' in text: return 'McLean'
-    if 'mgb' in text or 'mass general brigham' in text: return 'MGB'
+    # AIDEV-NOTE: Exclude "Psychiatry and Neurology" joint departments
+    # These are neurology departments that happen to include psychiatry in the name
+    if 'psychiatry and neurology' in text or 'psychiatry & neurology' in text:
+        return None  # Joint department - exclude
+
+    # Check which hospital (must be specific, not just "massachusetts")
+    if 'brigham' in text and 'women' in text:
+        return 'BWH'
+    if 'mass' in text and 'general' in text and 'hosp' in text:
+        return 'MGH'
+    if 'massachusetts general hospital' in text:
+        return 'MGH'
+    if 'mclean' in text:
+        return 'McLean'
+    if 'mgb' in text or 'mass general brigham' in text:
+        return 'MGB'
+
     return None
 
 def normalize_author_identity(last_name: str, fore_name: str, initials: str) -> str:
