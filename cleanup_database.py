@@ -10,6 +10,7 @@ Usage:
 import os
 import sys
 import argparse
+import time
 from datetime import datetime, timedelta
 from Bio import Entrez
 from sqlalchemy import create_engine, text
@@ -17,7 +18,22 @@ from sqlalchemy.orm import sessionmaker
 
 # Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local_storage.db")
-Entrez.email = os.getenv("ENTREZ_EMAIL", "test@example.com")
+ENTREZ_EMAIL = os.getenv("ENTREZ_EMAIL")
+
+# AIDEV-NOTE: Require ENTREZ_EMAIL to be set to avoid rate limiting issues
+if not ENTREZ_EMAIL:
+    print("=" * 80)
+    print("ERROR: ENTREZ_EMAIL environment variable not set!")
+    print("=" * 80)
+    print("\nThe PubMed API requires an email address for identification.")
+    print("This helps avoid rate limiting and allows NCBI to contact you if needed.")
+    print("\nPlease set ENTREZ_EMAIL before running this script:")
+    print("\n  export ENTREZ_EMAIL='your.email@example.com'")
+    print("  python cleanup_database.py --dry-run")
+    print("\n" + "=" * 80)
+    sys.exit(1)
+
+Entrez.email = ENTREZ_EMAIL
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -99,19 +115,45 @@ def check_investigator_validity(inv_id: str, inv_name: str, department: str = "p
         f'"{one_year_ago.strftime("%Y/%m/%d")}"[Date - Publication] : "{datetime.now().strftime("%Y/%m/%d")}"[Date - Publication]'
     )
 
+    # Retry logic for rate limiting
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # AIDEV-NOTE: Rate limiting - 0.5 seconds between requests
+            # NCBI allows 3 requests/second without API key, 10/second with key
+            time.sleep(0.5)
+
+            handle = Entrez.esearch(db="pubmed", term=query, retmax=10)
+            record = Entrez.read(handle)
+            handle.close()
+            pmids = record["IdList"]
+
+            if not pmids:
+                return False, "No recent papers found"
+
+            # Rate limit before fetching
+            time.sleep(0.5)
+
+            # Fetch paper details
+            fetch_handle = Entrez.efetch(db="pubmed", id=pmids[:5], retmode="xml")
+            papers = Entrez.read(fetch_handle)
+            fetch_handle.close()
+            break  # Success, exit retry loop
+
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg or "Too Many Requests" in error_msg:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                    print(f"    Rate limited, waiting {wait_time}s before retry {attempt + 2}/{max_retries}...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return False, "Rate limited after retries"
+            else:
+                return False, f"Error checking PubMed: {e}"
+
     try:
-        handle = Entrez.esearch(db="pubmed", term=query, retmax=10)
-        record = Entrez.read(handle)
-        handle.close()
-        pmids = record["IdList"]
-
-        if not pmids:
-            return False, "No recent papers found"
-
-        # Fetch paper details
-        fetch_handle = Entrez.efetch(db="pubmed", id=pmids[:5], retmode="xml")
-        papers = Entrez.read(fetch_handle)
-        fetch_handle.close()
 
         valid_affiliation_count = 0
         total_papers_checked = 0
@@ -175,10 +217,13 @@ def cleanup_database(dry_run: bool = True, department: str = "psychiatry"):
         investigators = result.fetchall()
 
         print(f"\nFound {len(investigators)} investigators in database")
-        print(f"\nChecking each investigator's recent publications...\n")
+        print(f"\nChecking each investigator's recent publications...")
+        print(f"Rate limit: ~1 second per investigator (to avoid API throttling)")
+        print(f"Estimated time: {len(investigators) // 60} minutes\n")
 
         to_remove = []
         to_keep = []
+        start_time = time.time()
 
         for i, (inv_id, inv_name) in enumerate(investigators, 1):
             print(f"[{i}/{len(investigators)}] Checking: {inv_name} ({inv_id})")
@@ -192,10 +237,15 @@ def cleanup_database(dry_run: bool = True, department: str = "psychiatry"):
                 to_remove.append((inv_id, inv_name, reason))
                 print(f"  ✗ REMOVE: {reason}")
 
-            # Rate limiting
-            if i % 10 == 0:
-                import time
-                time.sleep(1)
+            # Progress update every 50 investigators
+            if i % 50 == 0:
+                elapsed = time.time() - start_time
+                progress_pct = (i / len(investigators)) * 100
+                estimated_total = (elapsed / i) * len(investigators)
+                remaining = estimated_total - elapsed
+                print(f"\n  Progress: {i}/{len(investigators)} ({progress_pct:.1f}%)")
+                print(f"  Elapsed: {elapsed/60:.1f} min, Estimated remaining: {remaining/60:.1f} min")
+                print(f"  To keep: {len(to_keep)}, To remove: {len(to_remove)}\n")
 
         # Summary
         print("\n" + "=" * 80)
