@@ -12,7 +12,7 @@ import sys
 import argparse
 from datetime import datetime, timedelta
 from Bio import Entrez
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 # Configuration
@@ -167,11 +167,11 @@ def cleanup_database(dry_run: bool = True, department: str = "psychiatry"):
 
     try:
         # Get all investigators
-        result = db.execute("""
+        result = db.execute(text("""
             SELECT id, name
             FROM investigator_stats_v3
             ORDER BY name
-        """)
+        """))
         investigators = result.fetchall()
 
         print(f"\nFound {len(investigators)} investigators in database")
@@ -220,16 +220,16 @@ def cleanup_database(dry_run: bool = True, department: str = "psychiatry"):
 
                 for inv_id, inv_name, reason in to_remove:
                     # Remove investigator
-                    db.execute("""
+                    db.execute(text("""
                         DELETE FROM investigator_stats_v3
                         WHERE id = :inv_id
-                    """, {"inv_id": inv_id})
+                    """), {"inv_id": inv_id})
 
                     # Remove associated grants
-                    db.execute("""
+                    db.execute(text("""
                         DELETE FROM grant_details_v3
                         WHERE investigator_id = :inv_id
-                    """, {"inv_id": inv_id})
+                    """), {"inv_id": inv_id})
 
                     print(f"  ✓ Removed: {inv_name}")
 
