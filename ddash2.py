@@ -1235,6 +1235,10 @@ def perform_ai_profiling():
             set_system_status(status_db, "Ready", update_time=True)
         logger.info("AI Job Complete.")
 
+        # AIDEV-NOTE: Trigger embedding generation after AI profiling completes
+        logger.info("Triggering embedding generation...")
+        threading.Thread(target=perform_embedding_generation).start()
+
     except Exception as e:
         logger.error(f"AI JOB MAIN FAILURE: {e}")
         with SessionLocal() as status_db:
@@ -1394,7 +1398,7 @@ def perform_umap_generation():
 
         logger.info(f"Loaded {len(investigators)} investigators with embeddings")
 
-        # Parse embeddings and combine (75% themes/pops + 25% titles)
+        # Parse embeddings and combine (20% themes/pops + 80% titles)
         investigator_ids = []
         embeddings_list = []
 
@@ -1402,7 +1406,7 @@ def perform_umap_generation():
             try:
                 themes_pops_emb = np.array(json.loads(inv.embedding_themes_pops))
                 titles_emb = np.array(json.loads(inv.embedding_titles))
-                combined = 0.75 * themes_pops_emb + 0.25 * titles_emb
+                combined = 0.2 * themes_pops_emb + 0.8 * titles_emb
 
                 investigator_ids.append(inv.id)
                 embeddings_list.append(combined)
@@ -1843,8 +1847,8 @@ def smart_search(request: Request, query: str = Form(...), db: Session = Depends
                 similarity_themes_pops = cosine_similarity(query_embedding, themes_pops_embedding)
                 similarity_titles = cosine_similarity(query_embedding, titles_embedding)
 
-                # Weighted semantic blend: 75% themes/pops + 25% titles
-                semantic_score = (0.75 * similarity_themes_pops) + (0.25 * similarity_titles)
+                # Weighted semantic blend: 20% themes/pops + 80% titles
+                semantic_score = (0.2 * similarity_themes_pops) + (0.8 * similarity_titles)
 
                 # Get BM25 score for this investigator
                 bm25_score = float(bm25_scores_normalized[idx])

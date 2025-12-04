@@ -100,8 +100,8 @@ def load_embeddings_from_db() -> Tuple[List[str], np.ndarray]:
                 themes_pops_emb = np.array(json.loads(themes_pops_json))
                 titles_emb = np.array(json.loads(titles_json))
 
-                # Combine with same weighting as search: 75% themes/pops + 25% titles
-                combined = 0.75 * themes_pops_emb + 0.25 * titles_emb
+                # Combine with same weighting as search: 20% themes/pops + 80% titles
+                combined = 0.2 * themes_pops_emb + 0.8 * titles_emb
 
                 investigator_ids.append(inv_id)
                 embeddings_list.append(combined)

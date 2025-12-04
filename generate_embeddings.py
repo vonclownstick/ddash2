@@ -115,7 +115,7 @@ check_and_migrate_db()
 def build_themes_pops_text(inv_data: Dict) -> str:
     """
     Build profile text from themes and populations only.
-    This embedding will be prioritized (75%) in search ranking.
+    This embedding will be supplementary (20%) in search ranking.
 
     Args:
         inv_data: Dict with keys: themes, populations
@@ -141,7 +141,7 @@ def build_themes_pops_text(inv_data: Dict) -> str:
 def build_titles_text(inv_data: Dict) -> str:
     """
     Build profile text from publication and grant titles.
-    This embedding will be supplementary (25%) in search ranking.
+    This embedding will be prioritized (80%) in search ranking.
 
     Args:
         inv_data: Dict with keys: publications, grants
@@ -261,8 +261,8 @@ def process_investigator(db, inv_id: str) -> bool:
     Process one investigator: generate two separate embeddings.
 
     AIDEV-NOTE: Dual-embedding approach for better semantic search
-    - Embedding 1 (themes_pops): Research themes + study populations (75% weight)
-    - Embedding 2 (titles): Publication + grant titles (25% weight)
+    - Embedding 1 (themes_pops): Research themes + study populations (20% weight)
+    - Embedding 2 (titles): Publication + grant titles (80% weight)
     """
     try:
         # Load data
