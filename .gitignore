@@ -52,6 +52,7 @@ local_storage.db*
 htmlcov/
 test_*.py
 check_*.py
+debug_*.py
 
 # OS
 Thumbs.db
