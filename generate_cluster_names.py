@@ -7,9 +7,12 @@ Usage:
 
 This script:
 1. Loads all investigators with cluster assignments
-2. For each cluster, aggregates top research themes and populations
-3. Uses GPT-4o-mini to generate a concise, descriptive cluster name (1-3 words)
+2. For each cluster, aggregates publication titles and grant titles
+3. Uses GPT-5-mini to analyze actual research content and generate specific cluster names (1-3 words)
 4. Saves cluster names to database as JSON
+
+AIDEV-NOTE: Uses actual publication/grant titles (favoring publications) rather than
+AI-generated summaries for more accurate cluster naming.
 
 Requirements:
 - OPENAI_API_KEY environment variable set
@@ -62,38 +65,59 @@ logger.info("✅ Connected to database and OpenAI")
 
 
 def load_cluster_data(db):
-    """Load investigators grouped by cluster with their themes and populations."""
+    """Load investigators grouped by cluster with their publication and grant titles."""
     result = db.execute(text("""
-        SELECT cluster_id, name, tech_json, population_json
+        SELECT cluster_id, name, pmids_p2_json, id
         FROM investigator_stats_v3
         WHERE cluster_id IS NOT NULL
-        AND tech_json IS NOT NULL
-        AND population_json IS NOT NULL
     """)).fetchall()
 
     # Group by cluster
     clusters = {}
-    for cluster_id, name, tech_json, pop_json in result:
+    for cluster_id, name, pmids_json, inv_id in result:
         if cluster_id not in clusters:
             clusters[cluster_id] = {
                 "investigators": [],
-                "technologies": [],
-                "populations": []
+                "publication_titles": [],
+                "grant_titles": []
             }
 
         clusters[cluster_id]["investigators"].append(name)
 
-        # Parse technologies
-        try:
-            techs = json.loads(tech_json)
-            clusters[cluster_id]["technologies"].extend(techs)
-        except:
-            pass
+        # Get publication titles (top 10 by RCR from last 2 years)
+        if pmids_json:
+            try:
+                pmids = json.loads(pmids_json)
+                if pmids:
+                    pmid_list = ', '.join([f"'{p}'" for p in pmids[:50]])  # Limit to avoid huge query
+                    pub_result = db.execute(text(f"""
+                        SELECT title, rcr
+                        FROM paper_details_v3
+                        WHERE pmid IN ({pmid_list})
+                        AND pub_date >= date('now', '-2 years')
+                        ORDER BY rcr DESC
+                        LIMIT 10
+                    """)).fetchall()
 
-        # Parse populations
+                    for title, rcr in pub_result:
+                        if title:
+                            clusters[cluster_id]["publication_titles"].append(title)
+            except:
+                pass
+
+        # Get grant titles (last 2 years)
         try:
-            pops = json.loads(pop_json)
-            clusters[cluster_id]["populations"].extend(pops)
+            grant_result = db.execute(text("""
+                SELECT project_title
+                FROM grant_details_v3
+                WHERE investigator_id = :inv_id
+                AND fiscal_year >= :min_year
+                LIMIT 5
+            """), {"inv_id": inv_id, "min_year": 2023}).fetchall()
+
+            for (title,) in grant_result:
+                if title:
+                    clusters[cluster_id]["grant_titles"].append(title)
         except:
             pass
 
@@ -101,47 +125,69 @@ def load_cluster_data(db):
 
 
 def generate_cluster_name(cluster_id, cluster_data):
-    """Use GPT to generate a descriptive name for the cluster."""
-    # Get top themes and populations
-    tech_counter = Counter(cluster_data["technologies"])
-    pop_counter = Counter(cluster_data["populations"])
+    """Use GPT to generate a descriptive name for the cluster based on actual research titles."""
+    # Combine publication titles (prioritized) and grant titles
+    pub_titles = cluster_data.get("publication_titles", [])
+    grant_titles = cluster_data.get("grant_titles", [])
 
-    top_techs = [item for item, count in tech_counter.most_common(10)]
-    top_pops = [item for item, count in pop_counter.most_common(10)]
+    # Favor publication titles - take up to 30 pub titles, then fill with grants
+    all_titles = pub_titles[:30] + grant_titles[:10]
 
-    # Build prompt
-    prompt = f"""You are analyzing a cluster of {len(cluster_data['investigators'])} biomedical researchers.
+    if not all_titles:
+        logger.warning(f"⚠️  No titles found for Cluster {cluster_id}, using generic name")
+        return f"Cluster {cluster_id}"
 
-Top research technologies/methods:
-{', '.join(top_techs[:8])}
+    # Truncate very long titles
+    truncated_titles = [t[:150] for t in all_titles[:25]]
+    titles_text = "\n- ".join(truncated_titles)
 
-Top study populations:
-{', '.join(top_pops[:8])}
+    # Build improved prompt
+    prompt = f"""You are analyzing a cluster of {len(cluster_data['investigators'])} psychiatry researchers at Massachusetts General Hospital/Brigham and Women's Hospital/McLean Hospital.
 
-Generate a concise, descriptive name (1-3 words) for this research cluster that captures the main theme.
-Examples of good cluster names:
+Below are recent publication titles and grant titles from researchers in this cluster:
+
+- {titles_text}
+
+TASK: Generate a concise, descriptive name (1-3 words) that captures the PRIMARY research focus of this cluster.
+
+REQUIREMENTS:
+- Be SPECIFIC about the research domain (e.g., "Mood Disorders", not "Mental Health")
+- Use psychiatric/neurological terminology when relevant (e.g., "Psychosis", "Addiction", "PTSD")
+- Mention methods ONLY if they're the defining feature (e.g., "Neuroimaging Studies")
+- Mention populations ONLY if highly specific (e.g., "Pediatric Anxiety", not "Clinical Studies")
+- Avoid generic terms like "Research", "Studies", "Analysis"
+
+GOOD EXAMPLES:
+- "Psychosis Treatment"
+- "Addiction Neuroscience"
+- "Mood Disorders"
+- "Child Psychiatry"
 - "Neuroimaging"
-- "Cancer Genomics"
-- "Pediatric Mental Health"
-- "Cardiovascular Epidemiology"
+- "PTSD & Trauma"
 
-Respond with ONLY the cluster name, nothing else."""
+BAD EXAMPLES:
+- "Mental Health Research" (too generic)
+- "Clinical Studies" (too vague)
+- "Biomedical Research" (not specific)
 
-    logger.info(f"🤖 Generating name for Cluster {cluster_id}...")
+Respond with ONLY the cluster name (1-3 words), nothing else."""
+
+    logger.info(f"🤖 Generating name for Cluster {cluster_id} ({len(all_titles)} titles)...")
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5-mini",
         messages=[
-            {"role": "system", "content": "You are a research classification expert. Generate concise, accurate cluster names."},
+            {"role": "system", "content": "You are an expert in psychiatry research classification. Generate highly specific, accurate cluster names based on actual research content."},
             {"role": "user", "content": prompt}
         ],
-        max_completion_tokens=50
+        max_completion_tokens=20,
+        temperature=0.3  # Lower temperature for more consistent, focused names
     )
 
     cluster_name = response.choices[0].message.content.strip().strip('"').strip("'")
 
     logger.info(f"   ✅ Cluster {cluster_id}: '{cluster_name}'")
-    logger.info(f"      ({len(cluster_data['investigators'])} investigators)")
+    logger.info(f"      ({len(cluster_data['investigators'])} investigators, {len(pub_titles)} pubs, {len(grant_titles)} grants)")
 
     return cluster_name
 
