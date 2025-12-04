@@ -8,7 +8,7 @@ Usage:
 This script:
 1. Loads all investigators with cluster assignments
 2. For each cluster, aggregates publication titles and grant titles
-3. Uses GPT-5-mini to analyze actual research content and generate specific cluster names (1-3 words)
+3. Uses chatgpt-4o-latest to analyze actual research content and generate specific cluster names (1-3 words)
 4. Saves cluster names to database as JSON
 
 AIDEV-NOTE: Uses actual publication/grant titles (favoring publications) rather than
@@ -175,7 +175,7 @@ Respond with ONLY the cluster name (1-3 words), nothing else."""
     logger.info(f"🤖 Generating name for Cluster {cluster_id} ({len(all_titles)} titles)...")
 
     response = client.chat.completions.create(
-        model="gpt-5-mini",
+        model="chatgpt-4o-latest",
         messages=[
             {"role": "system", "content": "You are an expert in psychiatry research classification. Generate highly specific, accurate cluster names based on actual research content."},
             {"role": "user", "content": prompt}
