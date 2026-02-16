@@ -107,6 +107,14 @@ ddash2/
 
 **Graceful Degradation**: The app checks `DB_AVAILABLE` throughout. If database connection fails, users see a maintenance page instead of errors. All background jobs also check availability before running.
 
+**PostgreSQL Connection Resilience** (Lines 88-116, 335-350):
+- `pool_pre_ping=True` tests connections before use (critical for cloud deployments)
+- `pool_recycle=3600` recycles connections hourly to prevent staleness
+- Retry logic in dashboard route (3 attempts with exponential backoff)
+- Connection validation in `get_db()` dependency via `SELECT 1`
+- Error detection for connection-specific failures (SSL, timeouts, DNS)
+- See `POSTGRES_FIX.md` for complete deployment troubleshooting guide
+
 **Author Identity Normalization** (Line 264):
 ```python
 normalize_author_identity(last_name, fore_name, initials)
@@ -179,6 +187,8 @@ This canonical ID is used across all tables to link investigators.
 6. **Hamburger Menu**: Positioned absolute, closes on outside click (static/app.js).
 
 7. **Deployment Port**: Uses `PORT` env var for cloud deployment compatibility (Line 967).
+
+8. **PostgreSQL Connection Drops**: When deployed to Render/Heroku with PostgreSQL, connections can become stale or drop. The app has built-in retry logic (3 attempts with exponential backoff) and connection validation (`pool_pre_ping`). If seeing repeated connection errors, check `POSTGRES_FIX.md` for troubleshooting steps.
 
 ## AIDEV Notes
 

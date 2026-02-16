@@ -43,6 +43,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- DATABASE RETRY DECORATOR ---
+# AIDEV-NOTE: Decorator to retry database operations on connection failures
+from functools import wraps
+from sqlalchemy.exc import OperationalError, DBAPIError
+
+def retry_on_db_error(max_retries=3, delay=1.0):
+    """
+    Decorator to retry database operations when they fail due to connection issues.
+    Common on cloud platforms like Render where connections can drop.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (OperationalError, DBAPIError) as e:
+                    last_exception = e
+                    error_msg = str(e).lower()
+                    # Check if it's a recoverable connection error
+                    is_connection_error = any(phrase in error_msg for phrase in [
+                        'ssl connection',
+                        'closed unexpectedly',
+                        'could not translate',
+                        'connection reset',
+                        'connection refused',
+                        'timeout',
+                        'broken pipe'
+                    ])
+
+                    if is_connection_error and attempt < max_retries - 1:
+                        logger.warning(f"Database connection error (attempt {attempt + 1}/{max_retries}): {e}")
+                        time.sleep(delay * (attempt + 1))  # Exponential backoff
+                        continue
+                    else:
+                        # Not a connection error or max retries reached
+                        raise
+            raise last_exception
+        return wrapper
+    return decorator
+
 # --- CONFIGURATION ---
 # AIDEV-NOTE: All sensitive configuration is now loaded from environment variables
 USER_PASSWORD = os.getenv("USER_PASSWORD", "")
@@ -86,13 +128,30 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # AIDEV-NOTE: Database connection with error handling for deployment
+# AIDEV-NOTE: pool_pre_ping=True tests connections before use (critical for cloud DB)
+# AIDEV-NOTE: pool_recycle=3600 recycles connections every hour to prevent stale connections
 try:
-    engine = create_engine(
-        DATABASE_URL,
-        connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
-        pool_size=20,
-        max_overflow=0
-    )
+    if "sqlite" in DATABASE_URL:
+        # SQLite configuration
+        engine = create_engine(
+            DATABASE_URL,
+            connect_args={"check_same_thread": False},
+            pool_size=20,
+            max_overflow=0
+        )
+    else:
+        # PostgreSQL configuration for cloud deployment
+        engine = create_engine(
+            DATABASE_URL,
+            pool_pre_ping=True,           # Test connections before using them
+            pool_recycle=3600,             # Recycle connections after 1 hour
+            pool_size=5,                   # Smaller pool for free/hobby tier
+            max_overflow=10,               # Allow overflow for concurrent requests
+            connect_args={
+                "connect_timeout": 10,     # 10 second connection timeout
+                "options": "-c statement_timeout=30000"  # 30 second query timeout
+            }
+        )
 
     @event.listens_for(Engine, "connect")
     def set_sqlite_pragma(dbapi_connection, connection_record):
@@ -272,11 +331,22 @@ if DB_AVAILABLE:
 # AIDEV-NOTE: get_db must be defined at module level, not inside if DB_AVAILABLE block
 # This ensures routes can import it even if initial DB connection fails
 def get_db():
+    """
+    AIDEV-NOTE: Database session dependency with connection validation.
+    Tests the connection before yielding to catch stale connections early.
+    """
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
     db = SessionLocal()
     try:
+        # Test the connection before yielding
+        # This forces pool_pre_ping to validate the connection
+        db.execute(text("SELECT 1"))
         yield db
+    except Exception as e:
+        db.close()
+        logger.error(f"Database session error: {e}")
+        raise HTTPException(status_code=503, detail="Database connection failed")
     finally:
         db.close()
 
@@ -1542,31 +1612,59 @@ def home(request: Request, db: Session = Depends(get_db)):
         return templates.TemplateResponse("maintenance.html", {"request": request})
 
     try:
-        state = db.query(SystemState).filter_by(id=1).first()
-        status_txt = state.status if state else "Ready"
-        last_upd = state.last_updated if state else "Never"
+        # Retry database queries with exponential backoff
+        max_retries = 3
+        last_error = None
 
-        # AIDEV-NOTE: Filter investigators
-        # Only exclude probable misclassifications (<10% MGB affiliation in past 12 months)
-        # The misclassification filter is more accurate than arbitrary thresholds
-        all_investigators = db.query(InvestigatorStat).all()
-        inv_list = [
-            inv for inv in all_investigators
-            if (inv.probable_misclassification == 0 or inv.probable_misclassification is None)
-        ]
-        # Sort by current funding
-        inv_list.sort(key=lambda x: x.funding_current, reverse=True)
+        for attempt in range(max_retries):
+            try:
+                state = db.query(SystemState).filter_by(id=1).first()
+                status_txt = state.status if state else "Ready"
+                last_upd = state.last_updated if state else "Never"
 
-        return templates.TemplateResponse("index.html", {
-            "request": request,
-            "investigators": inv_list,
-            "status": status_txt,
-            "last_updated": last_upd,
-            "is_admin": request.session.get("is_admin", False),
-            "user_type": user_type
-        })
+                # AIDEV-NOTE: Filter investigators
+                # Only exclude probable misclassifications (<10% MGB affiliation in past 12 months)
+                # The misclassification filter is more accurate than arbitrary thresholds
+                all_investigators = db.query(InvestigatorStat).all()
+                inv_list = [
+                    inv for inv in all_investigators
+                    if (inv.probable_misclassification == 0 or inv.probable_misclassification is None)
+                ]
+                # Sort by current funding
+                inv_list.sort(key=lambda x: x.funding_current, reverse=True)
+
+                return templates.TemplateResponse("index.html", {
+                    "request": request,
+                    "investigators": inv_list,
+                    "status": status_txt,
+                    "last_updated": last_upd,
+                    "is_admin": request.session.get("is_admin", False),
+                    "user_type": user_type
+                })
+            except (OperationalError, DBAPIError) as e:
+                last_error = e
+                error_msg = str(e).lower()
+                is_connection_error = any(phrase in error_msg for phrase in [
+                    'ssl connection', 'closed unexpectedly', 'could not translate',
+                    'connection reset', 'timeout', 'broken pipe'
+                ])
+
+                if is_connection_error and attempt < max_retries - 1:
+                    logger.warning(f"Dashboard DB error (attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(1.0 * (attempt + 1))  # Exponential backoff
+                    # Force new connection
+                    db.close()
+                    db = SessionLocal()
+                    continue
+                else:
+                    raise
+
+        # If we exhausted retries, raise the last error
+        if last_error:
+            raise last_error
+
     except Exception as e:
-        logger.error(f"Error loading dashboard: {e}")
+        logger.error(f"Error loading dashboard: {e}", exc_info=True)
         return templates.TemplateResponse("maintenance.html", {"request": request})
 
 @app.get("/status_fragment", response_class=HTMLResponse)
@@ -1576,12 +1674,16 @@ def status_fragment(request: Request, db: Session = Depends(get_db)):
     if not DB_AVAILABLE:
         return HTMLResponse("<span class='px-2 py-1 rounded bg-red-600 font-medium'>DB Unavailable</span>")
 
-    state = db.query(SystemState).filter_by(id=1).first()
-    status_txt = state.status if state else "Unknown"
-    content = f"""<span class="px-2 py-1 rounded bg-amber-500 font-medium animate-pulse" hx-get="/status_fragment" hx-trigger="load delay:1s" hx-swap="outerHTML">{status_txt}</span>"""
-    if status_txt == "Ready" or "Error" in status_txt:
-         return HTMLResponse("<div id='status-container' hx-trigger='load' hx-get='/' hx-target='body'>Reloading...</div>", headers={"Cache-Control": "no-store"})
-    return HTMLResponse(content, headers={"Cache-Control": "no-store"})
+    try:
+        state = db.query(SystemState).filter_by(id=1).first()
+        status_txt = state.status if state else "Unknown"
+        content = f"""<span class="px-2 py-1 rounded bg-amber-500 font-medium animate-pulse" hx-get="/status_fragment" hx-trigger="load delay:1s" hx-swap="outerHTML">{status_txt}</span>"""
+        if status_txt == "Ready" or "Error" in status_txt:
+             return HTMLResponse("<div id='status-container' hx-trigger='load' hx-get='/' hx-target='body'>Reloading...</div>", headers={"Cache-Control": "no-store"})
+        return HTMLResponse(content, headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        logger.error(f"Error in status_fragment: {e}")
+        return HTMLResponse("<span class='px-2 py-1 rounded bg-red-600 font-medium'>DB Error</span>", headers={"Cache-Control": "no-store"})
 
 @app.post("/refresh_pubs")
 def trigger_pubs(request: Request, db: Session = Depends(get_db)):
