@@ -127,52 +127,80 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local_storage.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+logger.info(f"Connecting to database: {DATABASE_URL.split('@')[0] if '@' in DATABASE_URL else 'SQLite'}")
+
 # AIDEV-NOTE: Database connection with error handling for deployment
 # AIDEV-NOTE: pool_pre_ping=True tests connections before use (critical for cloud DB)
 # AIDEV-NOTE: pool_recycle=3600 recycles connections every hour to prevent stale connections
-try:
-    if "sqlite" in DATABASE_URL:
-        # SQLite configuration
-        engine = create_engine(
-            DATABASE_URL,
-            connect_args={"check_same_thread": False},
-            pool_size=20,
-            max_overflow=0
-        )
-    else:
-        # PostgreSQL configuration for cloud deployment
-        engine = create_engine(
-            DATABASE_URL,
-            pool_pre_ping=True,           # Test connections before using them
-            pool_recycle=3600,             # Recycle connections after 1 hour
-            pool_size=5,                   # Smaller pool for free/hobby tier
-            max_overflow=10,               # Allow overflow for concurrent requests
-            connect_args={
-                "connect_timeout": 10,     # 10 second connection timeout
-                "options": "-c statement_timeout=30000"  # 30 second query timeout
-            }
-        )
+# AIDEV-NOTE: Retry connection up to 5 times with exponential backoff (for cloud startup delays)
 
-    @event.listens_for(Engine, "connect")
-    def set_sqlite_pragma(dbapi_connection, connection_record):
+max_db_retries = 5
+last_db_error = None
+
+for db_attempt in range(max_db_retries):
+    try:
+        if db_attempt > 0:
+            logger.info(f"Database connection attempt {db_attempt + 1}/{max_db_retries}...")
+            time.sleep(2 ** db_attempt)  # Exponential backoff: 2s, 4s, 8s, 16s
+
         if "sqlite" in DATABASE_URL:
-            cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.close()
+            # SQLite configuration
+            engine = create_engine(
+                DATABASE_URL,
+                connect_args={"check_same_thread": False},
+                pool_size=20,
+                max_overflow=0
+            )
+        else:
+            # PostgreSQL configuration for cloud deployment
+            engine = create_engine(
+                DATABASE_URL,
+                pool_pre_ping=True,           # Test connections before using them
+                pool_recycle=3600,             # Recycle connections after 1 hour
+                pool_size=5,                   # Smaller pool for free/hobby tier
+                max_overflow=10,               # Allow overflow for concurrent requests
+                connect_args={
+                    "connect_timeout": 10,     # 10 second connection timeout
+                    "options": "-c statement_timeout=30000"  # 30 second query timeout
+                }
+            )
 
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    Base = declarative_base()
+        @event.listens_for(Engine, "connect")
+        def set_sqlite_pragma(dbapi_connection, connection_record):
+            if "sqlite" in DATABASE_URL:
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.close()
 
-    DB_AVAILABLE = True
-    logger.info("✅ Database connection established")
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base = declarative_base()
 
-except Exception as e:
-    logger.error(f"❌ Database connection failed: {e}")
-    DB_AVAILABLE = False
-    # Create dummy session for graceful degradation
-    SessionLocal = None
-    Base = None
+        # Test the connection immediately
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+
+        DB_AVAILABLE = True
+        logger.info("✅ Database connection established")
+        logger.info(f"   Database type: {'PostgreSQL' if 'postgresql' in DATABASE_URL else 'SQLite'}")
+        break  # Success! Exit retry loop
+
+    except Exception as e:
+        last_db_error = e
+        engine = None  # Reset engine for retry
+        if db_attempt < max_db_retries - 1:
+            logger.warning(f"⚠️  Database connection failed (attempt {db_attempt + 1}/{max_db_retries}): {e}")
+            continue
+        else:
+            # Final failure after all retries
+            logger.error(f"❌ Database connection failed after {max_db_retries} attempts: {e}")
+            logger.error(f"   DATABASE_URL starts with: {DATABASE_URL[:20]}...")
+            import traceback
+            logger.error(f"   Full error: {traceback.format_exc()}")
+            DB_AVAILABLE = False
+            # Create dummy session for graceful degradation
+            SessionLocal = None
+            Base = None
 
 # 2. Models
 if DB_AVAILABLE:
@@ -311,10 +339,17 @@ if DB_AVAILABLE:
                 logger.error(f"Migration failed: {e}")
 
     try:
+        logger.info("Creating database tables...")
         Base.metadata.create_all(bind=engine)
+        logger.info("✅ Database tables created/verified")
+
+        logger.info("Running database migrations...")
         check_and_migrate_db()
+        logger.info("✅ Database migrations complete")
     except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
+        logger.error(f"❌ Database initialization failed: {e}")
+        import traceback
+        logger.error(f"   Full error: {traceback.format_exc()}")
         DB_AVAILABLE = False
 
     # --- SELF-HEALING STARTUP ---
